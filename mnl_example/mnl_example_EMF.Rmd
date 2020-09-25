@@ -1,0 +1,150 @@
+---
+title: "MNL Example"
+author: "Morgan Bale"
+date: "9/14/2020"
+output: github_document
+---
+
+This file provides two examples of (aggregate) multinomial logit models suitable for scanner panel data executed in Stan. The first example is a basic multinomial logit model where there is a common choice set of products available for each week (`X`) and multiple observed choices from that common choice set (`Y`). The choice set can be ragged, so that each week has a different number of available choices. The second example is a multinomial logit model where there is also an estimated brand intercept for each product and multiple products may have the same intercept (e.g. UPCs within the same brand).
+
+Using the synthetic data created below, we are able to see how well the models recover our chosen brand parameters. To run this file, you must have the `mnl_example1.stan` and `mnl_example2.stan` files in the same director as this `.Rmd` file.
+
+```{r, include=FALSE}
+library(MASS)
+library(tidyverse)
+library(rstan) # stan
+library(bayesplot) # mcmc_combo
+library(gtools) # rdirchlet
+rstan_options(auto_write=TRUE) # writes a compiled Stan program to the disk to avoid recompiling
+options(mc.cores = parallel::detectCores()-1) # uses multiple cores for stan
+```
+
+######## EXAMPLE 1 #########
+
+The following function creates synthetic data for our first model. Note, that this function produces synthetic data with the same number of products in each week, but the stan function below accomodates ragged numbers of products in each week. 
+```{r}
+gen_mnl_data1 <- function(N=100,  # obs per week
+                          T=52,   # num weeks
+                          JJ=7,   # num products
+                          beta=c(1, 1)  #attribute coefs
+                          ) 
+{
+  NN <- T*N              # total num choices
+  K = length(beta)       # num attributes
+  t=rep(1:T, each=N)     # week for each choice
+  Y <- rep(NA, NN)
+  X_list <- list(NULL) 
+  for (n in 1:T) {
+    X_list[[n]] <- matrix(rnorm(JJ*K), ncol=K) # universal choice set for each week
+  }
+  M <- JJ * T
+  J <- rep(JJ, T)
+  xstart <- (1:T) * J - (J[1]-1)
+  X <- matrix(NA, nrow= T*JJ, ncol= K)
+  for (i in 1:length(X_list)) {
+    X[xstart[i]:(xstart[i] + J[i] - 1), ] <- X_list[[i]]
+  }
+  for (i in 1:NN) {
+    Y[i] <- sample(x=JJ, size=1, prob=exp(X_list[[t[i]]] %*% beta))
+  }
+  list(N=NN, J=J, JJ=JJ, K=K, T=T, t=t, Y=Y,  X=X, beta=beta, M=M, xstart=xstart)
+}
+```
+
+Using the function above we create data called `mnl_data1` with 52 weeks, 7 products in the choice set for each week, and 100 observed choices in each week.
+```{r}
+set.seed(20030601)
+mnl_data1 <- gen_mnl_data1(T=52, N=100, JJ=7, beta=c(1,1))
+```
+
+The following shows the model code from `mnl_example1.stan`
+```{r}
+model_1 <- stan_model(file="mnl_example1.stan")
+print(model_1)
+```
+
+Now run the model using the synthetic data and save the results as `model_1_results`
+```{r}
+model_1_results <- sampling(model_1, data=mnl_data1, seed=09302020)
+```
+
+Check to see if the model recovered the parameters for the product attributes (beta). 
+```{r}
+mcmc_recover_hist(As.mcmc.list(model_1_results, pars="beta"), true=mnl_data1$beta)
+```
+
+####### EXAMPLE 2 #########
+
+The following function creates synthetic data for our second model. This function is similar to the one above, except that it allows you to specify how many products (upcs) are available in each week and what brand each of those products belongs to. 
+```{r}
+gen_mnl_data2 <- function(N=100,                   # obs per week
+                          T=52,                    # num weeks
+                          b=c(1,1,2,2,3,3),        # brands for each UPC 
+                                                   # (length of b indicates num UPC)
+                          beta=c(1, 1),            # attribute coefs
+                          gamma.mean=c(-1, 0, 1))  #mean brand params
+{
+  NN <- T*N               # total num choices
+  JJ = length(b)          # num UPCs
+  K = length(beta)        # num attributes
+  B = length(unique(b))   # num brands
+  if (min(b%%1==0) == 0 | min(b) != 1 | max(b) != B | length(unique(b)) != B) 
+    stop("b should be integer values indicating the brand for each UPC")
+  t=rep(1:T, each=N)     # week for each choice
+  gamma <- rnorm(B, mean=gamma.mean, sd=rep(.5, B)) 
+  gamma <- gamma - mean(gamma)
+  Y <- rep(NA, NN)
+  X_list <- list(NULL) 
+  for (n in 1:T) {
+    X_list[[n]] <- matrix(rnorm(JJ*K), ncol=K) # universal choice set for each week
+  }
+  alpha <- gamma[b]
+  M <- JJ * T
+  J <- rep(JJ, T)
+  xstart <- (1:T) * J - (J[1]-1)
+  X <- matrix(NA, nrow= T*JJ, ncol= K)
+  b <- rep(b, T)
+  for (i in 1:length(X_list)) {
+    X[xstart[i]:(xstart[i] + J[i] - 1), ] <- X_list[[i]]
+  }
+  for (i in 1:NN) {
+    Y[i] <- sample(x=JJ, size=1, prob=exp(alpha + X_list[[t[i]]] %*% beta))
+  }
+  list(N=NN, J=J, JJ=JJ, K=K, T=T, B=B, b=b, t=t, Y=Y,  X=X, beta=beta, gamma=gamma, M=M, xstart=xstart)
+}
+```
+
+Using the function above we create data with 7 UPCS and 3 brands called `mnl_data2`. And when we do that, it generates a vector `b` which indicates the brand for each upc. 
+```{r}
+set.seed(20030601)
+mnl_data2 <- gen_mnl_data2(b=c(1,1,2,2,3,3,3))
+
+mnl_data2$b
+```
+
+The Stan code allows you to specify that some of the products belong to the same "brand" (as seen below). When you fit the Stan model, it will estimate an intercept for each brand specified in the b vector that applies to all upcs within that brand.
+
+The following shows the model code from `mnl_example2.stan`.
+```{r}
+model_2 <- stan_model(file="mnl_example2.stan")
+print(model_2)
+```
+
+Now run the model using the synthetic data and save the results as `model_2_results`.
+```{r}
+model_2_results <- sampling(model_2, data=mnl_data2, seed=09302020)
+```
+
+Check to see if the model recovered the parameters for the product attributes (beta) and the brand intercepts (gamma). 
+```{r}
+mcmc_recover_hist(As.mcmc.list(model_2_results, pars="beta"), true=mnl_data2$beta)
+mcmc_recover_hist(As.mcmc.list(model_2_results, pars="gamma"), true=as.vector(t(mnl_data2$gamma)))
+```
+
+
+
+
+
+
+
+
